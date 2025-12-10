@@ -1,0 +1,32 @@
+name: "Clean IMAP"
+version: "1.0.0"
+slug: "clean_imap"
+description: "Decodeert IMAP e-mails volledig en stuurt deze als nette tekst naar Home Assistant."
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+host_network: true
+
+options:
+  imap_host: "imap.gmail.com"
+  imap_port: 993
+  imap_username: ""
+  imap_password: ""
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_topic: "mail/decoded"
+
+schema:
+  imap_host: str
+  imap_port: int
+  imap_username: str
+  imap_password: str
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_username: str
+  mqtt_password: str
+  mqtt_topic: str
