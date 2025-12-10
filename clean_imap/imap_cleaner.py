@@ -6,6 +6,8 @@ import paho.mqtt.client as mqtt
 import time
 import json
 
+print("IMAP Cleaner: Python script started")
+
 # -------------------------------------------------------
 # 1. Lees Home Assistant add-on opties
 # -------------------------------------------------------
@@ -22,6 +24,8 @@ MQTT_PORT = int(opts.get("mqtt_port"))
 MQTT_USER = opts.get("mqtt_username")
 MQTT_PASS = opts.get("mqtt_password")
 MQTT_TOPIC = opts.get("mqtt_topic")
+
+print("IMAP Cleaner: Options geladen:", opts)
 
 # -------------------------------------------------------
 # 2. Helper: HTML opschonen
@@ -117,6 +121,7 @@ mqtt_client = mqtt.Client(
 if MQTT_USER and MQTT_PASS:
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 
+print("IMAP Cleaner: MQTT client gestart")
 
 # -------------------------------------------------------
 # 6. Main loop: IMAP uitlezen
@@ -159,3 +164,5 @@ def run_imap_loop():
 
 if __name__ == "__main__":
     run_imap_loop()
+
+print("IMAP Cleaner: Loop tick")
