@@ -5,8 +5,9 @@ from bs4 import BeautifulSoup
 import paho.mqtt.client as mqtt
 import time
 import json
+import sys
 
-print("IMAP Cleaner: Python script started")
+print("IMAP Cleaner: Python script started", flush=True)
 
 # -------------------------------------------------------
 # 1. Lees Home Assistant add-on opties
@@ -25,15 +26,16 @@ MQTT_USER = opts.get("mqtt_username")
 MQTT_PASS = opts.get("mqtt_password")
 MQTT_TOPIC = opts.get("mqtt_topic")
 
-print("IMAP Cleaner: Options geladen:", opts)
+print("IMAP Cleaner: Options geladen:", opts, flush=True)
 
 # -------------------------------------------------------
-# 2. Helper: HTML opschonen
+# 2. HTML opschonen
 # -------------------------------------------------------
 def html_to_text(html):
+    """Converteert HTML naar platte tekst."""
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(separator="\n")
-    # verwijder lege regels
+
     clean = "\n".join(
         line.strip() for line in text.splitlines() if line.strip()
     )
@@ -41,23 +43,28 @@ def html_to_text(html):
 
 
 # -------------------------------------------------------
-# 3. Header decoderen (onderwerp, afzender, etc.)
+# 3. Header (subject, from, etc.) veilig decoderen
 # -------------------------------------------------------
 def decode_header_value(value):
     if not value:
         return ""
     parts = decode_header(value)
     decoded = ""
+
     for text, enc in parts:
-        if isinstance(text, bytes):
-            decoded += text.decode(enc or "utf-8", errors="replace")
-        else:
-            decoded += text
+        try:
+            if isinstance(text, bytes):
+                decoded += text.decode(enc or "utf-8", errors="replace")
+            else:
+                decoded += text
+        except:
+            decoded += str(text)
+
     return decoded
 
 
 # -------------------------------------------------------
-# 4. Beste leesbare tekst zoeken in MIME e-mail
+# 4. Beste leesbare e-mailtekst ophalen (plain > html)
 # -------------------------------------------------------
 def extract_body(msg):
     text_plain = None
@@ -66,37 +73,36 @@ def extract_body(msg):
     if msg.is_multipart():
         for part in msg.walk():
             ctype = part.get_content_type()
+            payload = part.get_payload(decode=True)
+            charset = part.get_content_charset() or "utf-8"
 
             if ctype == "text/plain" and text_plain is None:
-                payload = part.get_payload(decode=True)
-                charset = part.get_content_charset()
                 try:
-                    text_plain = payload.decode(charset or "utf-8", errors="replace")
+                    text_plain = payload.decode(charset, errors="replace")
                 except:
                     pass
 
             elif ctype == "text/html" and text_html is None:
-                payload = part.get_payload(decode=True)
-                charset = part.get_content_charset()
                 try:
-                    text_html = payload.decode(charset or "utf-8", errors="replace")
+                    text_html = payload.decode(charset, errors="replace")
                 except:
                     pass
+
     else:
-        ctype = msg.get_content_type()
         payload = msg.get_payload(decode=True)
+        charset = msg.get_content_charset() or "utf-8"
 
-        if payload:
-            charset = msg.get_content_charset()
-            try:
-                decoded = payload.decode(charset or "utf-8", errors="replace")
-            except:
-                decoded = None
+        try:
+            decoded = payload.decode(charset, errors="replace")
+        except:
+            decoded = None
 
-            if ctype == "text/plain":
-                text_plain = decoded
-            elif ctype == "text/html":
-                text_html = decoded
+        ctype = msg.get_content_type()
+
+        if ctype == "text/plain":
+            text_plain = decoded
+        elif ctype == "text/html":
+            text_html = decoded
 
     if text_plain:
         return text_plain
@@ -107,9 +113,8 @@ def extract_body(msg):
 
 
 # -------------------------------------------------------
-# 5. Maak MQTT client – Future-proof (API v2)
+# 5. MQTT client (API v2 – future-proof)
 # -------------------------------------------------------
-
 mqtt_client = mqtt.Client(
     client_id="imap_cleaner",
     protocol=mqtt.MQTTv311,
@@ -117,16 +122,31 @@ mqtt_client = mqtt.Client(
     callback_api_version=2
 )
 
-# MQTT authenticatie (indien aanwezig)
 if MQTT_USER and MQTT_PASS:
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 
-print("IMAP Cleaner: MQTT client gestart")
+print("IMAP Cleaner: MQTT client gestart", flush=True)
+
 
 # -------------------------------------------------------
-# 6. Main loop: IMAP uitlezen
+# 6. MQTT publish functie (ontbrak!)
+# -------------------------------------------------------
+def mqtt_send(data):
+    try:
+        print("IMAP Cleaner: MQTT publish:", data, flush=True)
+        mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
+        mqtt_client.publish(MQTT_TOPIC, json.dumps(data))
+        mqtt_client.disconnect()
+    except Exception as e:
+        print("MQTT fout:", e, flush=True)
+
+
+# -------------------------------------------------------
+# 7. Main loop – IMAP uitlezen
 # -------------------------------------------------------
 def run_imap_loop():
+
+    print("IMAP Cleaner: IMAP loop gestart", flush=True)
 
     while True:
         try:
@@ -135,6 +155,7 @@ def run_imap_loop():
             mail.select("INBOX")
 
             status, ids = mail.search(None, "UNSEEN")
+            print("IMAP Cleaner: UNSEEN:", status, ids, flush=True)
 
             if status == "OK":
                 for msg_id in ids[0].split():
@@ -158,11 +179,12 @@ def run_imap_loop():
             time.sleep(5)
 
         except Exception as e:
-            print("IMAP fout:", e)
+            print("IMAP fout:", e, flush=True)
             time.sleep(10)
 
 
+# -------------------------------------------------------
+# 8. Start script
+# -------------------------------------------------------
 if __name__ == "__main__":
     run_imap_loop()
-
-print("IMAP Cleaner: Loop tick")
