@@ -1,5 +1,5 @@
 name: "Clean IMAP"
-version: "1.0.2"
+version: "1.0.3"
 slug: "clean_imap"
 description: "Decodeert IMAP e-mails volledig en stuurt deze als nette tekst naar Home Assistant."
 arch:
