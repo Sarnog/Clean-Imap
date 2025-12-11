@@ -199,12 +199,42 @@ def main():
         )
 
     # IMAP verbinden
-    try:
-        imap = imaplib.IMAP4_SSL(imap_host, imap_port)
-        imap.login(imap_user, imap_pass)
-    except Exception as e:
-        LOG.error("Kon niet verbinden met IMAP (%s:%s): %s", imap_host, imap_port, e)
-        sys.exit(1)
+try:
+    imap = imaplib.IMAP4_SSL(imap_host, imap_port)
+except Exception as e:
+    logger.error(
+        "Kon geen SSL-verbinding maken met IMAP (%s:%s): %s",
+        imap_host,
+        imap_port,
+        e,
+    )
+    sys.exit(1)
+
+# Debuglogging zonder wachtwoord te tonen
+try:
+    pw_len = len(imap_password or "")
+except TypeError:
+    pw_len = 0
+
+logger.info(
+    "IMAP Cleaner: Inloggen op IMAP als '%s' (wachtwoordlengte: %d tekens).",
+    imap_username,
+    pw_len,
+)
+
+try:
+    # LET OP: twee argumenten, NIET samengevoegd / geformatteerd
+    imap.login(imap_username, imap_password)
+except imaplib.IMAP4.error as e:
+    logger.error(
+        "Kon niet inloggen op IMAP (%s:%s) als '%s': %s",
+        imap_host,
+        imap_port,
+        imap_username,
+        e,
+    )
+    sys.exit(1)
+
 
     # MQTT client (Callback API v2)
     try:
