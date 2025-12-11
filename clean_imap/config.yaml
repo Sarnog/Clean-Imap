@@ -1,11 +1,12 @@
 name: "IMAP Cleaner"
-description: "Decodeert IMAP e-mails en stuurt nette tekst naar Home Assistant via MQTT."
-version: "1.0.7"
+version: "1.0.8"
 slug: "imap_cleaner"
+description: "Decodeert IMAP e-mails volledig en stuurt deze als nette tekst naar Home Assistant via MQTT."
 arch:
   - amd64
   - aarch64
-startup: application
+
+startup: services
 boot: auto
 host_network: true
 
@@ -25,10 +26,10 @@ schema:
   imap_host: str
   imap_port: int
   imap_username: str
-  imap_password: str
+  imap_password: password          # ← wachtwoord met sterretjes + oogje
   mqtt_host: str
   mqtt_port: int
   mqtt_username: str
-  mqtt_password: str
+  mqtt_password: password          # ← wachtwoord met sterretjes + oogje
   mqtt_topic: str
   mark_as_read: bool
