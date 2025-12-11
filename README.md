@@ -82,8 +82,9 @@ Payload-voorbeeld:
 }
 ```
 
-Om de Add-on te integreren in Home Assistant moet een MQTT sensor gemaakt worden.
-Open je config-file in een editor en voeg onderstaande toe:
+# 🧩 Integratie met Home Assistant (MQTT Sensor)
+
+#### Voeg het onderstaande toe aan je configuratie (configuration.yaml), om de add-on te integreren in Home Assistant:
 
 ```
 mqtt:
@@ -102,3 +103,113 @@ mqtt:
         }
 ```
 
+
+# English version:
+
+
+# 📬 IMAP Cleaner Add-on for Home Assistant
+
+The **IMAP Cleaner** add-on automatically processes incoming emails using IMAP and publishes a fully decoded plain-text version to an MQTT topic.  
+This allows you to easily create Home Assistant automations triggered by email content, such as:
+
+- 🔔 Service notifications  
+- 🔒 Verification or registration emails  
+- 🔧 Any automation that relies on email events  
+
+The add-on supports:
+
+- **Gmail**
+- **iCloud**
+- **Outlook / Office365**
+- **Ziggo / KPN IMAP**
+- **Any standard IMAP server**
+
+It automatically handles:
+
+- Base64 content  
+- HTML → clean plain text  
+- Multipart emails  
+- Unicode headers  
+- Irregular or malformed formats  
+
+MQTT publishing is standardized, ensuring your Home Assistant sensors always receive clean, structured data.
+
+---
+
+# 🚀 Installation via Custom Repository
+
+1. Open **Home Assistant**
+2. Go to **Settings → Add-ons → Add-on Store**
+3. Click **⋮ (top right) → Repositories**
+4. Add the following repository URL:
+
+https://github.com/Sarnog/Imap-Cleaner
+
+5. Click **Add**
+6. The add-on **IMAP Cleaner** will now appear in the list  
+7. Click **Install**
+
+---
+
+# ⚙️ Add-on Configuration
+
+Inside the add-on settings, you will find these options:
+
+| Setting | Type | Description |
+|--------|------|-------------|
+| `imap_host` | Text | IMAP server, e.g., `imap.gmail.com` |
+| `imap_port` | Number | IMAP port, typically **993** |
+| `imap_username` | Text | Your email address |
+| `imap_password` | Password | Hidden by default |
+| `mqtt_host` | Text | MQTT broker hostname, e.g., `core-mosquitto` |
+| `mqtt_port` | Number | MQTT port, usually **1883** |
+| `mqtt_username` | Text | Username for MQTT |
+| `mqtt_password` | Password | Hidden by default |
+| `mqtt_topic` | Text | MQTT topic where decoded mail is published |
+| `mark_as_read` | Boolean | Whether emails should be marked as read |
+
+### ✨ Password Fields
+
+- Shown as **asterisks**
+- Can be revealed using a **show/hide eye icon**
+
+---
+
+# 📡 MQTT Output Format
+
+Every processed email is published to the following MQTT topic:
+
+mail/decoded
+
+Example JSON payload:
+
+```json
+{
+  "onderwerp": "Welcome to the club",
+  "afzender": "no-reply@club.com",
+  "tekst": "Dear Member,..."
+}
+```
+
+# 🧩 Integrating With Home Assistant (MQTT Sensor)
+
+To use the add-on output in automations, create an MQTT sensor.
+
+Add the following to your Home Assistant configuration (configuration.yaml or your package-based structure):
+
+```
+mqtt:
+  sensor:
+    - name: "Clean IMAP Add-on Results"
+      unique_id: "clean_imap_addon_resultaten"
+      state_topic: "mail/decoded"
+      value_template: >
+        {{ value_json.tekst[:200] ~ '...' }}
+      json_attributes_topic: "mail/decoded"
+      json_attributes_template: >
+        {
+          "tekst": {{ value_json.tekst | tojson }},
+          "onderwerp": {{ value_json.onderwerp | tojson }},
+          "afzender": {{ value_json.afzender | tojson }}
+        }
+```
