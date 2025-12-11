@@ -163,7 +163,7 @@ def main():
     cfg = load_config()
 
     # Config uit options.json
-    imap_host = cfg.get("imap_server", "")
+    imap_host = cfg.get("imap_server") or cfg.get("imap_host") or ""
     imap_port = cfg.get("imap_port", 993)
     imap_user = cfg.get("imap_user", "")
     imap_pass = cfg.get("imap_password", "")
