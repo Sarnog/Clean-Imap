@@ -7,7 +7,7 @@ import time
 import json
 import os
 
-print("IMAP Cleaner: Python script gestart (Gmail-compatibele versie)", flush=True)
+print("IMAP Cleaner: Python script gestart (Gmail-compatibele versie + UID-fix)", flush=True)
 
 # -------------------------------------------------------
 # 1. Lees Home Assistant add-on opties
@@ -38,14 +38,31 @@ print(
 # -------------------------------------------------------
 UID_FILE = "/data/imap_processed_uids.json"
 
+
 def load_uids():
     if not os.path.exists(UID_FILE):
         return set()
     try:
         with open(UID_FILE, "r") as f:
-            return set(json.load(f))
-    except:
+            loaded = json.load(f)
+
+        # Oude fallback UID's (SEQ-...) negeren, die zijn van een eerdere misconfig
+        cleaned = {
+            u for u in loaded
+            if isinstance(u, str) and not u.startswith("SEQ-")
+        }
+
+        if len(cleaned) < len(loaded):
+            print(
+                f"IMAP Cleaner: {len(loaded) - len(cleaned)} oude fallback UID(s) verwijderd",
+                flush=True,
+            )
+
+        return cleaned
+    except Exception as e:
+        print("Kon UID-bestand niet laden:", e, flush=True)
         return set()
+
 
 def save_uids(uids):
     try:
@@ -53,6 +70,7 @@ def save_uids(uids):
             json.dump(list(uids), f)
     except Exception as e:
         print("Kon UID-bestand niet opslaan:", e, flush=True)
+
 
 processed_uids = load_uids()
 print(f"{len(processed_uids)} UID(s) eerder verwerkt", flush=True)
@@ -64,6 +82,7 @@ def html_to_text(html):
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(separator="\n")
     return "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
 
 # -------------------------------------------------------
 # 4. Header decode
@@ -79,17 +98,15 @@ def decode_header_value(value):
                 result += text.decode(enc or "utf-8", errors="replace")
             else:
                 result += text
-        except:
+        except Exception:
             result += str(text)
     return result
+
 
 # -------------------------------------------------------
 # 5. Beste mail-body bepalen
 # -------------------------------------------------------
 def extract_body(msg):
-    text_plain = None
-    text_html = None
-
     for part in msg.walk():
         ctype = part.get_content_type()
         payload = part.get_payload(decode=True)
@@ -101,17 +118,18 @@ def extract_body(msg):
         if ctype == "text/plain":
             try:
                 return payload.decode(charset, errors="replace")
-            except:
+            except Exception:
                 pass
 
         if ctype == "text/html":
             try:
                 html = payload.decode(charset, errors="replace")
                 return html_to_text(html)
-            except:
+            except Exception:
                 pass
 
     return "(Geen leesbare inhoud gevonden)"
+
 
 # -------------------------------------------------------
 # 6. MQTT client (API v2)
@@ -125,6 +143,7 @@ mqtt_client = mqtt.Client(
 if MQTT_USER and MQTT_PASS:
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 
+
 def mqtt_send(data):
     try:
         print("MQTT publish:", data, flush=True)
@@ -134,53 +153,62 @@ def mqtt_send(data):
     except Exception as e:
         print("MQTT fout:", e, flush=True)
 
+
 # -------------------------------------------------------
 # 7. Gmail-compatibele UID opvragen
 # -------------------------------------------------------
 def get_uid(mail, seq_id):
     """
-    Correcte manier om UID op te halen bij Gmail (en overige IMAP servers).
+    Haal de echte UID op bij een bericht met sequence-ID 'seq_id'.
 
-    Gmail ondersteunt *niet*:
-        UID FETCH <seq>
-
-    Gmail ondersteunt wél:
-        FETCH <seq> (UID)
+    Gmail (en veel andere IMAP-servers) geven bij:
+        FETCH <seq_id> (UID)
+    een header terug waar 'UID <nummer>' in staat.
     """
-
     try:
         status, response = mail.fetch(seq_id, "(UID)")
-        if status == "OK" and response and isinstance(response[0], tuple):
-            header = response[0][0].decode("utf-8", errors="ignore").upper()
+        if status == "OK" and response and response[0]:
+            first = response[0]
+
+            # first kan bytes of tuple zijn
+            if isinstance(first, tuple):
+                header_bytes = first[0]
+            else:
+                header_bytes = first
+
+            header = header_bytes.decode("utf-8", errors="ignore").upper()
+            print(f"IMAP Cleaner: UID header voor {seq_id}: {header}", flush=True)
+
             if "UID" in header:
-                try:
-                    uid = header.split("UID")[1].split()[0].strip()
+                parts = header.split("UID", 1)[1].split()
+                if parts:
+                    uid = parts[0].strip()
+                    print(f"IMAP Cleaner: Echte UID gevonden voor {seq_id}: {uid}", flush=True)
                     return uid
-                except:
-                    pass
     except Exception as e:
-        print(f"GMAIL UID-fetch fout voor message {seq_id}: {e}", flush=True)
+        print(
+            f"IMAP Cleaner: fout bij UID opvragen voor {seq_id}: {e}",
+            flush=True,
+        )
 
     # Fallback als alles faalt
     fallback_uid = f"SEQ-{seq_id.decode()}"
-    print(f"UID fallback gebruikt: {fallback_uid}", flush=True)
+    print(f"IMAP Cleaner: UID fallback gebruikt: {fallback_uid}", flush=True)
     return fallback_uid
 
+
 # -------------------------------------------------------
-# 8. MAIL FETCH helper (Gmail-compatibel)
+# 8. MAIL FETCH helper
 # -------------------------------------------------------
 def fetch_message(mail, seq_id, uid):
     """
     Probeer eerst:
-        FETCH <seq> (RFC822)
-
+      FETCH <seq_id> (RFC822)
     Daarna (optioneel):
-        UID FETCH <uid> (RFC822)
+      UID FETCH <uid> (RFC822)
 
-    Gmail vereist sequence-fetch, niet UID-fetch.
-    Andere servers kunnen beide.
+    Gmail werkt prima met FETCH seq_id.
     """
-    # Gmail pad: werkt altijd
     try:
         status, data = mail.fetch(seq_id, "(RFC822)")
         if status == "OK" and data and len(data) > 0:
@@ -188,16 +216,16 @@ def fetch_message(mail, seq_id, uid):
     except Exception as e:
         print(f"FETCH seq error: {e}", flush=True)
 
-    # Andere IMAP servers ondersteunen vaak UID FETCH
     try:
         status, data = mail.uid("FETCH", uid, "(RFC822)")
         if status == "OK" and data and len(data) > 0:
             return data[0][1]
-    except:
-        pass
+    except Exception as e:
+        print(f"UID FETCH error voor UID {uid}: {e}", flush=True)
 
     print("Kon bericht niet fetchen voor:", seq_id, flush=True)
     return None
+
 
 # -------------------------------------------------------
 # 9. Main loop
@@ -229,16 +257,15 @@ def run_imap_loop():
             print("UNSEEN gevonden:", seq_ids, flush=True)
 
             for seq_id in seq_ids:
-
-                # Stap 1 → UID ophalen via Gmail-compatible methode
+                # 1) UID ophalen
                 uid = get_uid(mail, seq_id)
 
-                # Stap 2 → Dedup
-                if uid in processed_uids and not MARK_AS_READ:
+                # 2) Dedup, alleen als we mails ongelezen laten
+                if not MARK_AS_READ and uid in processed_uids:
                     print(f"Skip: UID {uid} is al verwerkt", flush=True)
                     continue
 
-                # Stap 3 → Bericht ophalen
+                # 3) Bericht ophalen
                 raw_bytes = fetch_message(mail, seq_id, uid)
                 if not raw_bytes:
                     print("Kon mail niet ophalen:", seq_id, flush=True)
@@ -250,13 +277,15 @@ def run_imap_loop():
                 afzender = decode_header_value(msg.get("from"))
                 tekst = extract_body(msg)
 
-                mqtt_send({
-                    "onderwerp": onderwerp,
-                    "afzender": afzender,
-                    "tekst": tekst,
-                })
+                mqtt_send(
+                    {
+                        "onderwerp": onderwerp,
+                        "afzender": afzender,
+                        "tekst": tekst,
+                    }
+                )
 
-                # Stap 4 → UID opslaan zodat we nooit dubbel verwerken
+                # 4) UID markeren als verwerkt
                 if not MARK_AS_READ:
                     processed_uids.add(uid)
                     save_uids(processed_uids)
@@ -267,6 +296,7 @@ def run_imap_loop():
         except Exception as e:
             print("IMAP fout:", e, flush=True)
             time.sleep(10)
+
 
 # -------------------------------------------------------
 # Start
