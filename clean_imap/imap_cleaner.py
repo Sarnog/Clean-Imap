@@ -1,352 +1,407 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import imaplib
 import email
+from email.header import decode_header
+from bs4 import BeautifulSoup
+import paho.mqtt.client as mqtt
+import time
 import json
 import os
-import sys
-import time
-import logging
-import re
 
-import paho.mqtt.client as mqtt
+print("IMAP Cleaner: Python script gestart (Gmail-compatibele versie + UID-fix, v2)", flush=True)
 
-# -----------------------------------------------------------
-# Logging configuratie
-# -----------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="IMAP Cleaner: %(message)s",
-    stream=sys.stdout,
+# -------------------------------------------------------
+# 1. Lees Home Assistant add-on opties
+# -------------------------------------------------------
+with open("/data/options.json", "r") as f:
+    opts = json.load(f)
+
+
+def to_int(value, default=0):
+    """
+    Converteer naar int, of geef default terug als het mislukt.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+IMAP_HOST = opts.get("imap_host")
+IMAP_PORT = to_int(opts.get("imap_port"), 0)
+IMAP_USER = opts.get("imap_username")
+IMAP_PASS = opts.get("imap_password")
+
+MQTT_HOST = opts.get("mqtt_host")
+MQTT_PORT = to_int(opts.get("mqtt_port"), 0)
+MQTT_USER = opts.get("mqtt_username")
+MQTT_PASS = opts.get("mqtt_password")
+MQTT_TOPIC = opts.get("mqtt_topic")
+
+POLL_INTERVAL = to_int(opts.get("poll_interval"), 60)
+MARK_AS_READ = bool(opts.get("mark_as_read", False))
+
+
+print(
+    f"Opties geladen: IMAP host={IMAP_HOST}, user={IMAP_USER}, "
+    f"mark_as_read={MARK_AS_READ}, poll_interval={POLL_INTERVAL}s",
+    flush=True,
 )
 
-LOG = logging.getLogger("imap_cleaner")
-
-
-# -----------------------------------------------------------
-# Config laden + basisvalidatie
-# -----------------------------------------------------------
-def load_config():
-    options_path = "/data/options.json"
-    if not os.path.exists(options_path):
-        LOG.error("Configuratiebestand %s niet gevonden.", options_path)
-        sys.exit(1)
-
-    try:
-        with open(options_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-    except Exception as e:
-        LOG.error("Kon configuratie niet lezen (%s): %s", options_path, e)
-        sys.exit(1)
-
-    return cfg
-
-
-def validate_hostname(name, value):
-    if not isinstance(value, str) or not value.strip():
-        LOG.error("Ongeldige hostnaam voor %s: '%s'", name, value)
-        sys.exit(1)
-
-
+# -------------------------------------------------------
+# 1b. Config-validatie (host / poorten / wachtwoorden)
+# -------------------------------------------------------
 def validate_port(name, value):
+    if not isinstance(value, int):
+        print(f"IMAP Cleaner: Ongeldige {name}-poort (geen getal): {value!r}", flush=True)
+        return False
+    if value <= 0 or value > 65535:
+        print(f"IMAP Cleaner: Ongeldige {name}-poort (buiten bereik 1-65535): {value}", flush=True)
+        return False
+    return True
+
+
+def validate_config():
+    fouten = False
+
+    # IMAP
+    if not IMAP_HOST or not isinstance(IMAP_HOST, str):
+        print("IMAP Cleaner: Ongeldige IMAP-hostnaam in configuratie.", flush=True)
+        fouten = True
+    if not validate_port("IMAP", IMAP_PORT):
+        fouten = True
+    if not IMAP_USER:
+        print("IMAP Cleaner: Geen IMAP-gebruikersnaam opgegeven in configuratie.", flush=True)
+        fouten = True
+    if not IMAP_PASS:
+        print("IMAP Cleaner: GEEN IMAP-wachtwoord opgegeven in configuratie!", flush=True)
+        fouten = True
+
+    # MQTT
+    if not MQTT_HOST or not isinstance(MQTT_HOST, str):
+        print("IMAP Cleaner: Ongeldige MQTT-hostnaam in configuratie.", flush=True)
+        fouten = True
+    if not validate_port("MQTT", MQTT_PORT):
+        fouten = True
+
+    if not MQTT_TOPIC:
+        print(
+            "IMAP Cleaner: Waarschuwing: geen MQTT-topic opgegeven; "
+            "er wordt niets gepubliceerd.",
+            flush=True,
+        )
+
+    # Poll-interval
+    if POLL_INTERVAL <= 0:
+        print(
+            f"IMAP Cleaner: Ongeldig poll_interval ({POLL_INTERVAL}), gebruik fallback 60s.",
+            flush=True,
+        )
+
+    # Extra waarschuwing voor MQTT-wachtwoord (niet verplicht, maar aanbevolen)
+    if not MQTT_PASS:
+        print(
+            "IMAP Cleaner: Let op: geen MQTT-wachtwoord opgegeven. "
+            "Authenticatie voor MQTT wordt sterk aanbevolen.",
+            flush=True,
+        )
+
+    if fouten:
+        print("IMAP Cleaner: Configuratiefouten gevonden, script wordt afgesloten.", flush=True)
+        raise SystemExit(1)
+
+
+# -------------------------------------------------------
+# 2. Persistent UID tracking
+# -------------------------------------------------------
+UID_FILE = "/data/imap_processed_uids.json"
+
+
+def load_uids():
+    if not os.path.exists(UID_FILE):
+        return set()
     try:
-        port = int(value)
-    except (TypeError, ValueError):
-        LOG.error("Poort voor %s is geen geldig getal: '%s'", name, value)
-        sys.exit(1)
+        with open(UID_FILE, "r") as f:
+            loaded = json.load(f)
 
-    if port < 1 or port > 65535:
-        LOG.error("Poort voor %s moet tussen 1 en 65535 liggen (nu: %s).", name, port)
-        sys.exit(1)
+        # Oude fallback UID's (SEQ-...) negeren
+        cleaned = {
+            u for u in loaded
+            if isinstance(u, str) and not u.startswith("SEQ-")
+        }
 
-    return port
+        if len(cleaned) < len(loaded):
+            print(
+                f"IMAP Cleaner: {len(loaded) - len(cleaned)} oude fallback UID(s) verwijderd",
+                flush=True,
+            )
+
+        return cleaned
+    except Exception as e:
+        print("IMAP Cleaner: Kon UID-bestand niet laden:", e, flush=True)
+        return set()
 
 
-# -----------------------------------------------------------
-# E-mail hulpfuncties
-# -----------------------------------------------------------
-def decode_header_value(raw):
-    """Decodeer MIME header (subject, from, …) naar nette unicode."""
-    from email.header import decode_header
+def save_uids(uids):
+    try:
+        with open(UID_FILE, "w") as f:
+            json.dump(list(uids), f)
+    except Exception as e:
+        print("IMAP Cleaner: Kon UID-bestand niet opslaan:", e, flush=True)
 
-    if not raw:
+
+processed_uids = load_uids()
+print(f"IMAP Cleaner: {len(processed_uids)} UID(s) eerder verwerkt", flush=True)
+
+# -------------------------------------------------------
+# 3. HTML → tekst conversie
+# -------------------------------------------------------
+def html_to_text(html):
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(separator="\n")
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+# -------------------------------------------------------
+# 4. Header decode
+# -------------------------------------------------------
+def decode_header_value(value):
+    if not value:
         return ""
-
-    parts = decode_header(raw)
-    decoded = ""
+    parts = decode_header(value)
+    result = ""
     for text, enc in parts:
-        if isinstance(text, bytes):
-            try:
-                decoded += text.decode(enc or "utf-8", errors="replace")
-            except Exception:
-                decoded += text.decode("utf-8", errors="replace")
-        else:
-            decoded += text
-
-    return decoded
-
-
-def extract_text_from_message(msg):
-    """
-    Haal de tekstuele inhoud uit de e-mail (prefereer text/plain).
-    Geeft een unicode string terug.
-    """
-    if msg.is_multipart():
-        # Eerst zoeken naar text/plain
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            disp = str(part.get("Content-Disposition", "")).lower()
-            if ctype == "text/plain" and "attachment" not in disp:
-                try:
-                    charset = part.get_content_charset() or "utf-8"
-                    return part.get_payload(decode=True).decode(charset, errors="replace")
-                except Exception:
-                    return part.get_payload(decode=True).decode("utf-8", errors="replace")
-
-        # Fallback: eerste text/html naar platte tekst strippen
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            disp = str(part.get("Content-Disposition", "")).lower()
-            if ctype == "text/html" and "attachment" not in disp:
-                try:
-                    charset = part.get_content_charset() or "utf-8"
-                    html = part.get_payload(decode=True).decode(charset, errors="replace")
-                except Exception:
-                    html = part.get_payload(decode=True).decode("utf-8", errors="replace")
-
-                # heel simpele HTML-strip
-                text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
-                text = re.sub(r"<[^>]+>", " ", text)
-                text = re.sub(r"\s+", " ", text)
-                return text.strip()
-    else:
-        # Enkelvoudige e-mail
-        ctype = msg.get_content_type()
         try:
-            charset = msg.get_content_charset() or "utf-8"
-            payload = msg.get_payload(decode=True)
-            if payload is None:
-                return ""
-            body = payload.decode(charset, errors="replace")
+            if isinstance(text, bytes):
+                result += text.decode(enc or "utf-8", errors="replace")
+            else:
+                result += text
         except Exception:
-            body = msg.get_payload(decode=True).decode("utf-8", errors="replace")
+            result += str(text)
+    return result
+
+
+# -------------------------------------------------------
+# 5. Beste mail-body bepalen
+# -------------------------------------------------------
+def extract_body(msg):
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+
+        charset = part.get_content_charset() or "utf-8"
+
+        if ctype == "text/plain":
+            try:
+                return payload.decode(charset, errors="replace")
+            except Exception:
+                pass
 
         if ctype == "text/html":
-            body = re.sub(r"<br\s*/?>", "\n", body, flags=re.I)
-            body = re.sub(r"<[^>]+>", " ", body)
-            body = re.sub(r"\s+", " ", body)
-        return body.strip()
+            try:
+                html = payload.decode(charset, errors="replace")
+                return html_to_text(html)
+            except Exception:
+                pass
 
-    return ""
-
-
-# -----------------------------------------------------------
-# MQTT callbacks (Callback API v2)
-# -----------------------------------------------------------
-def on_connect(client, userdata, flags, rc, properties=None):
-    if rc == 0:
-        LOG.info("Verbonden met MQTT broker.")
-    else:
-        LOG.error("Verbinding met MQTT broker mislukt (code %s).", rc)
+    return "(Geen leesbare inhoud gevonden)"
 
 
-def on_disconnect(client, userdata, rc, properties=None):
-    # rc kan 0 (normaal) of anders zijn
-    LOG.info("Verbinding met MQTT broker verbroken (code %s).", rc)
-
-
-# -----------------------------------------------------------
-# Hoofdlogica
-# -----------------------------------------------------------
-def main():
-    cfg = load_config()
-
-    # Config uit options.json
-    imap_host = cfg.get("imap_server") or cfg.get("imap_host") or ""
-    imap_port = cfg.get("imap_port", 993)
-    imap_user = cfg.get("imap_user", "")
-    imap_pass = cfg.get("imap_password", "")
-    imap_mailbox = cfg.get("imap_mailbox", "INBOX")
-
-    mqtt_host = cfg.get("mqtt_host", "")
-    mqtt_port = cfg.get("mqtt_port", 1883)
-    mqtt_user = cfg.get("mqtt_username", "")
-    mqtt_pass = cfg.get("mqtt_password", "")
-    mqtt_topic = cfg.get("mqtt_topic", "mail/decoded")
-
-    poll_interval = int(cfg.get("poll_interval", 60))
-
-    # Validatie host/poort
-    validate_hostname("IMAP", imap_host)
-    imap_port = validate_port("IMAP", imap_port)
-
-    validate_hostname("MQTT", mqtt_host)
-    mqtt_port = validate_port("MQTT", mqtt_port)
-
-    # Wachtwoord-checks
-    if not imap_pass:
-        LOG.error(
-            "Er is geen IMAP-wachtwoord opgegeven in de configuratie. "
-            "Controleer de add-on instellingen."
-        )
-        sys.exit(1)
-
-    if mqtt_user and not mqtt_pass:
-        LOG.warning(
-            "MQTT-gebruikersnaam is ingevuld, maar er ontbreekt een MQTT-wachtwoord "
-            "in de configuratie."
-        )
-
-    # IMAP verbinden
-try:
-    imap = imaplib.IMAP4_SSL(imap_host, imap_port)
-except Exception as e:
-    logger.error(
-        "Kon geen SSL-verbinding maken met IMAP (%s:%s): %s",
-        imap_host,
-        imap_port,
-        e,
-    )
-    sys.exit(1)
-
-# Debuglogging zonder wachtwoord te tonen
-try:
-    pw_len = len(imap_password or "")
-except TypeError:
-    pw_len = 0
-
-logger.info(
-    "IMAP Cleaner: Inloggen op IMAP als '%s' (wachtwoordlengte: %d tekens).",
-    imap_username,
-    pw_len,
+# -------------------------------------------------------
+# 6. MQTT client (API v2 – geen DeprecationWarning)
+# -------------------------------------------------------
+mqtt_client = mqtt.Client(
+    client_id="imap_cleaner",
+    protocol=mqtt.MQTTv311,
+    callback_api_version=2,
 )
 
-try:
-    # LET OP: twee argumenten, NIET samengevoegd / geformatteerd
-    imap.login(imap_username, imap_password)
-except imaplib.IMAP4.error as e:
-    logger.error(
-        "Kon niet inloggen op IMAP (%s:%s) als '%s': %s",
-        imap_host,
-        imap_port,
-        imap_username,
-        e,
-    )
-    sys.exit(1)
+if MQTT_USER and MQTT_PASS:
+    mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 
 
-    # MQTT client (Callback API v2)
-    try:
-        client = mqtt.Client(
-            client_id="imap_cleaner",
-            protocol=mqtt.MQTTv311,
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-        )
-    except TypeError:
-        # Fallback voor heel oude paho-mqtt (zou je eigenlijk niet meer moeten hebben)
-        client = mqtt.Client(client_id="imap_cleaner", protocol=mqtt.MQTTv311)
-
-    if mqtt_user:
-        client.username_pw_set(mqtt_user, mqtt_pass or None)
-
-    client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
+def mqtt_send(data):
+    if not MQTT_TOPIC:
+        print("IMAP Cleaner: MQTT-topic niet ingesteld, bericht wordt niet gepubliceerd.", flush=True)
+        return
 
     try:
-        client.connect(mqtt_host, mqtt_port, keepalive=60)
+        print(f"IMAP Cleaner: MQTT publish naar {MQTT_HOST}:{MQTT_PORT}, topic={MQTT_TOPIC}", flush=True)
+        mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
+        mqtt_client.publish(MQTT_TOPIC, json.dumps(data))
+        mqtt_client.disconnect()
     except Exception as e:
-        LOG.error("Kon niet verbinden met MQTT broker (%s:%s): %s", mqtt_host, mqtt_port, e)
-        sys.exit(1)
+        print("IMAP Cleaner: MQTT-fout:", e, flush=True)
 
-    client.loop_start()
 
-    LOG.info(
-        "gestart. Poll-interval: %s seconden. IMAP server: %s:%s, MQTT broker: %s:%s, topic: %s",
-        poll_interval,
-        imap_host,
-        imap_port,
-        mqtt_host,
-        mqtt_port,
-        mqtt_topic,
+# -------------------------------------------------------
+# 7. Gmail-compatibele UID opvragen
+# -------------------------------------------------------
+def get_uid(mail, seq_id):
+    """
+    Haal de echte UID op bij een bericht met sequence-ID 'seq_id'.
+    """
+    try:
+        status, response = mail.fetch(seq_id, "(UID)")
+        if status == "OK" and response and response[0]:
+            first = response[0]
+
+            # first kan bytes of tuple zijn
+            if isinstance(first, tuple):
+                header_bytes = first[0]
+            else:
+                header_bytes = first
+
+            header = header_bytes.decode("utf-8", errors="ignore").upper()
+            print(f"IMAP Cleaner: UID header voor {seq_id}: {header}", flush=True)
+
+            if "UID" in header:
+                parts = header.split("UID", 1)[1].split()
+                if parts:
+                    uid = parts[0].strip()
+                    print(
+                        f"IMAP Cleaner: Echte UID gevonden voor {seq_id}: {uid}",
+                        flush=True,
+                    )
+                    return uid
+    except Exception as e:
+        print(
+            f"IMAP Cleaner: fout bij UID opvragen voor {seq_id}: {e}",
+            flush=True,
+        )
+
+    # Fallback als alles faalt
+    fallback_uid = f"SEQ-{seq_id.decode()}"
+    print(f"IMAP Cleaner: UID fallback gebruikt: {fallback_uid}", flush=True)
+    return fallback_uid
+
+
+# -------------------------------------------------------
+# 8. MAIL FETCH helper
+# -------------------------------------------------------
+def fetch_message(mail, seq_id, uid):
+    """
+    Probeer eerst:
+      FETCH <seq_id> (RFC822)
+    Daarna (optioneel):
+      UID FETCH <uid> (RFC822)
+    """
+    try:
+        status, data = mail.fetch(seq_id, "(RFC822)")
+        if status == "OK" and data and len(data) > 0:
+            return data[0][1]
+    except Exception as e:
+        print(f"IMAP Cleaner: FETCH seq error: {e}", flush=True)
+
+    try:
+        status, data = mail.uid("FETCH", uid, "(RFC822)")
+        if status == "OK" and data and len(data) > 0:
+            return data[0][1]
+    except Exception as e:
+        print(f"IMAP Cleaner: UID FETCH error voor UID {uid}: {e}", flush=True)
+
+    print("IMAP Cleaner: Kon bericht niet fetchen voor:", seq_id, flush=True)
+    return None
+
+
+# -------------------------------------------------------
+# 9. Main loop
+# -------------------------------------------------------
+def run_imap_loop():
+    if MARK_AS_READ:
+        print(
+            "IMAP Cleaner: Modus mark_as_read=TRUE "
+            "(mails worden gelezen gemarkeerd, geen UID-deduplicatie).",
+            flush=True,
+        )
+    else:
+        print(
+            "IMAP Cleaner: Modus mark_as_read=FALSE "
+            "(UID-deduplicatie, mails blijven ongelezen).",
+            flush=True,
+        )
+
+    print(
+        f"IMAP Cleaner: gestart. Poll-interval: {POLL_INTERVAL} seconden. "
+        f"IMAP server: {IMAP_HOST}:{IMAP_PORT}, MQTT broker: {MQTT_HOST}:{MQTT_PORT}, topic: {MQTT_TOPIC}",
+        flush=True,
     )
-
-    last_uid = None
 
     while True:
         try:
-            # Selecteer mailbox
-            status, _ = imap.select(imap_mailbox)
+            # IMAP-verbinding
+            mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+            print("IMAP Cleaner: Verbonden met IMAP-server.", flush=True)
+
+            # Correcte login: altijd twee argumenten
+            mail.login(IMAP_USER, IMAP_PASS)
+            print(f"IMAP Cleaner: Ingelogd als '{IMAP_USER}'.", flush=True)
+
+            if MARK_AS_READ:
+                mail.select("INBOX")
+            else:
+                mail.select("INBOX", readonly=True)
+
+            status, ids = mail.search(None, "UNSEEN")
             if status != "OK":
-                LOG.error("Kan mailbox '%s' niet selecteren.", imap_mailbox)
-                time.sleep(poll_interval)
+                print("IMAP Cleaner: UNSEEN search fout:", status, flush=True)
+                mail.logout()
+                time.sleep(10)
                 continue
 
-            # Zoek ongelezen mails
-            status, data = imap.search(None, "UNSEEN")
-            if status != "OK":
-                LOG.error("Zoekopdracht naar ongelezen e-mails mislukt.")
-                time.sleep(poll_interval)
-                continue
+            seq_ids = ids[0].split()
+            print("IMAP Cleaner: UNSEEN gevonden:", seq_ids, flush=True)
 
-            ids = data[0].split()
-            if ids:
-                LOG.info("%s nieuwe e-mail(s) gevonden.", len(ids))
+            for seq_id in seq_ids:
+                # 1) UID ophalen
+                uid = get_uid(mail, seq_id)
 
-            for num in ids:
-                # Haal volledige mail op
-                status, msg_data = imap.fetch(num, "(RFC822)")
-                if status != "OK":
-                    LOG.error("Kon e-mail (UID %s) niet ophalen.", num)
+                # 2) Deduplicatie (alleen als we mails ongelezen laten)
+                if not MARK_AS_READ and uid in processed_uids:
+                    print(f"IMAP Cleaner: Skip – UID {uid} is al verwerkt", flush=True)
                     continue
 
-                raw_email = msg_data[0][1]
-                msg = email.message_from_bytes(raw_email)
+                # 3) Bericht ophalen
+                raw_bytes = fetch_message(mail, seq_id, uid)
+                if not raw_bytes:
+                    print("IMAP Cleaner: Kon mail niet ophalen:", seq_id, flush=True)
+                    continue
 
-                from_raw = msg.get("From", "")
-                subject_raw = msg.get("Subject", "")
-                date_raw = msg.get("Date", "")
+                msg = email.message_from_bytes(raw_bytes)
 
-                afzender = decode_header_value(from_raw)
-                onderwerp = decode_header_value(subject_raw)
-                tekst = extract_text_from_message(msg)
+                onderwerp = decode_header_value(msg.get("subject"))
+                afzender = decode_header_value(msg.get("from"))
+                tekst = extract_body(msg)
 
-                payload = {
-                    "uid": num.decode() if isinstance(num, bytes) else str(num),
-                    "afzender": afzender,
-                    "onderwerp": onderwerp,
-                    "tekst": tekst,
-                    "datum": date_raw,
-                }
-
-                # Publiceer naar MQTT
-                client.publish(mqtt_topic, json.dumps(payload), qos=0, retain=False)
-                LOG.info(
-                    "E-mail (UID %s) gepubliceerd op MQTT-topic '%s'.",
-                    payload["uid"],
-                    mqtt_topic,
+                mqtt_send(
+                    {
+                        "onderwerp": onderwerp,
+                        "afzender": afzender,
+                        "tekst": tekst,
+                    }
                 )
 
-                last_uid = payload["uid"]
+                # 4) UID markeren als verwerkt
+                if not MARK_AS_READ:
+                    processed_uids.add(uid)
+                    save_uids(processed_uids)
+
+            mail.logout()
+            time.sleep(POLL_INTERVAL if POLL_INTERVAL > 0 else 60)
 
         except imaplib.IMAP4.error as e:
-            LOG.error("IMAP-fout: %s. Poging tot herverbinden over %s seconden.", e, poll_interval)
-            try:
-                imap.logout()
-            except Exception:
-                pass
-            time.sleep(poll_interval)
-            try:
-                imap = imaplib.IMAP4_SSL(imap_host, imap_port)
-                imap.login(imap_user, imap_pass)
-            except Exception as e2:
-                LOG.error("Herverbinden met IMAP mislukt: %s", e2)
-
+            # Auth/IMAP-probleem (bijvoorbeeld verkeerde login)
+            print("IMAP Cleaner: IMAP-authenticatie- of protocolfout:", e, flush=True)
+            time.sleep(30)
         except Exception as e:
-            LOG.error("Onverwachte fout: %s", e)
+            print("IMAP Cleaner: IMAP fout:", e, flush=True)
+            time.sleep(10)
 
-        time.sleep(poll_interval)
 
-
+# -------------------------------------------------------
+# Start
+# -------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    validate_config()
+    run_imap_loop()
