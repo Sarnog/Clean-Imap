@@ -1,1 +1,105 @@
-A simple email decoder for Home Assistant
+# 📬 IMAP Cleaner Add-on voor Home Assistant
+
+De **IMAP Cleaner** add-on verwerkt automatisch inkomende e-mails via IMAP en publiceert de volledig gedecodeerde tekst (plain-text versie) naar een MQTT-topic.  
+Hiermee kun je gemakkelijk automations maken gebaseerd op e-mails, zoals:
+
+- 🔔 Service-meldingen  
+- 🔒 Registratiemeldingen  
+- 🔧 Alles wat jij uit e-mail wilt automatiseren  
+
+De add-on ondersteunt:
+
+- **Gmail**
+- **iCloud**
+- **Outlook / Office365**
+- **Ziggo/KPN IMAP**
+- **Elke standaard IMAP-server**
+
+En verwerkt automatisch:
+
+- Base64 inhoud  
+- HTML → platte tekst  
+- Multipart e-mails  
+- Unicode headers  
+- Onleesbare formats  
+
+MQTT publicatie is gestandaardiseerd, zodat jouw Home Assistant sensors altijd netjes bijgewerkt worden.
+
+---
+
+# 🚀 Installatie via Custom Repository
+
+1. Open Home Assistant  
+2. Ga naar **Instellingen → Add-ons → Add-on Store**  
+3. Klik rechtsboven op **⋮ → Repositories**  
+4. Voeg jouw repository toe:
+
+https://github.com/Sarnog/Imap-Cleaner
+
+5. Klik op **Add**  
+6. Je ziet nu de add-on **IMAP Cleaner** in de lijst  
+7. Klik op **Installeren**  
+
+---
+
+# ⚙️ Configuratie van de Add-on
+
+Wanneer je de add-on opent krijg je een aantal instellingen:
+
+| Instelling | Type | Omschrijving |
+|-----------|------|--------------|
+| `imap_host` | Tekst | De IMAP-server, bv. `imap.gmail.com` |
+| `imap_port` | Nummer | De IMAP-poort, meestal **993** |
+| `imap_username` | Tekst | Je e-mailadres |
+| `imap_password` | Wachtwoord | Wordt met sterretjes weergegeven |
+| `mqtt_host` | Tekst | MQTT broker hostnaam, bv. `core-mosquitto` |
+| `mqtt_port` | Nummer | MQTT poort, meestal **1883** |
+| `mqtt_username` | Tekst | Gebruikersnaam |
+| `mqtt_password` | Wachtwoord | Wordt met sterretjes weergegeven |
+| `mqtt_topic` | Tekst | Topic waarop e-maildata wordt gepubliceerd |
+| `mark_as_read` | True/False | Of e-mails gelezen worden gemarkeerd in je mailbox |
+
+### ✨ Wachtwoordvelden
+
+- verborgen achter **asterisks**
+- zichtbaar te maken via een **oog-icoon**
+
+---
+
+# 📡 MQTT Data-output
+
+Elke e-mail die de add-on verwerkt wordt gepubliceerd op:
+
+mail/decoded
+
+Payload-voorbeeld:
+
+```json
+{
+  "onderwerp": "Welcome to the club",
+  "afzender": "no-reply@club.com",
+  "tekst": "Dear Member,..."
+}
+
+Om de Add-on te integreren in Home Assistant moet een MQTT sensor gemaakt worden.
+Open je config-file in een editor en voeg onderstaande toe:
+
+```
+mqtt:
+  sensor:
+    - name: "Clean IMAP Add-on Resultaten"
+      unique_id: "clean_imap_addon_resultaten"
+      state_topic: "mail/decoded"
+
+      value_template: >
+        {{ value_json.tekst[:200] ~ '...' }}
+
+      json_attributes_topic: "mail/decoded"
+      json_attributes_template: >
+        {
+          "tekst": {{ value_json.tekst | tojson }},
+          "onderwerp": {{ value_json.onderwerp | tojson }},
+          "afzender": {{ value_json.afzender | tojson }}
+        }
+```
+
