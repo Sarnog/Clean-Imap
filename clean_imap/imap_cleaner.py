@@ -259,7 +259,7 @@ def get_uid(mail, seq_id):
             if "UID" in header:
                 parts = header.split("UID", 1)[1].split()
                 if parts:
-                    uid = parts[0].strip()
+                    uid = "".join(ch for ch in parts[0] if ch.isdigit())
                     print(
                         f"IMAP Cleaner: Echte UID gevonden voor {seq_id}: {uid}",
                         flush=True,
