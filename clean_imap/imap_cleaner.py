@@ -7,7 +7,7 @@ import time
 import json
 import os
 
-print("IMAP Cleaner: Python script gestart", flush=True)
+print("IMAP Cleaner: Python script gestart (Enterprise Reliability Mode)", flush=True)
 
 # -------------------------------------------------------
 # 1. Lees Home Assistant add-on opties
@@ -29,52 +29,39 @@ MQTT_TOPIC = opts.get("mqtt_topic")
 MARK_AS_READ = bool(opts.get("mark_as_read", False))
 
 print(
-    "IMAP Cleaner: Opties geladen "
-    f"(imap_host={IMAP_HOST}, imap_user={IMAP_USER}, mqtt_host={MQTT_HOST}, "
-    f"mqtt_topic={MQTT_TOPIC}, mark_as_read={MARK_AS_READ})",
+    f"Opties geladen: host={IMAP_HOST}, user={IMAP_USER}, mark_as_read={MARK_AS_READ}",
     flush=True,
 )
 
 # -------------------------------------------------------
-# 1b. Persistent opslaan van verwerkte UID's (alleen nodig als mark_as_read=False)
+# UID Persistence
 # -------------------------------------------------------
 PROCESSED_UIDS_FILE = "/data/imap_processed_uids.json"
-
 
 def load_processed_uids():
     if not os.path.exists(PROCESSED_UIDS_FILE):
         return set()
     try:
         with open(PROCESSED_UIDS_FILE, "r") as f:
-            data = json.load(f)
-        return set(data)
-    except Exception as e:
-        print("IMAP Cleaner: kon processed UIDs niet laden:", e, flush=True)
+            return set(json.load(f))
+    except:
         return set()
-
 
 def save_processed_uids(uids):
     try:
         with open(PROCESSED_UIDS_FILE, "w") as f:
             json.dump(list(uids), f)
     except Exception as e:
-        print("IMAP Cleaner: kon processed UIDs niet opslaan:", e, flush=True)
+        print("Kon UID-bestand niet opslaan:", e, flush=True)
 
+processed_uids = load_processed_uids()
+print(f"Loaded {len(processed_uids)} verwerkte UID(s)", flush=True)
 
-processed_uids = set()
-if not MARK_AS_READ:
-    processed_uids = load_processed_uids()
-    print(
-        f"IMAP Cleaner: {len(processed_uids)} eerder verwerkte UID(s) geladen "
-        "(alleen relevant bij mark_as_read=False)",
-        flush=True,
-    )
 
 # -------------------------------------------------------
-# 2. HTML opschonen
+# HTML opschonen
 # -------------------------------------------------------
 def html_to_text(html):
-    """Converteert HTML naar platte tekst."""
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(separator="\n")
     clean = "\n".join(line.strip() for line in text.splitlines() if line.strip())
@@ -82,100 +69,66 @@ def html_to_text(html):
 
 
 # -------------------------------------------------------
-# 3. Header (subject, from, etc.) veilig decoderen
+# Header decoderen
 # -------------------------------------------------------
 def decode_header_value(value):
     if not value:
         return ""
     parts = decode_header(value)
     decoded = ""
-
     for text, enc in parts:
         try:
             if isinstance(text, bytes):
                 decoded += text.decode(enc or "utf-8", errors="replace")
             else:
                 decoded += text
-        except Exception:
+        except:
             decoded += str(text)
-
     return decoded
 
 
 # -------------------------------------------------------
-# 4. Beste leesbare e-mailtekst ophalen (plain > html)
+# Beste body extraheren
 # -------------------------------------------------------
 def extract_body(msg):
     text_plain = None
     text_html = None
 
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            payload = part.get_payload(decode=True)
-            charset = part.get_content_charset() or "utf-8"
+    for part in msg.walk():
+        if part.get_content_type() == "text/plain":
+            text_plain = part.get_payload(decode=True)
+            if text_plain:
+                charset = part.get_content_charset() or "utf-8"
+                try: return text_plain.decode(charset, errors="replace")
+                except: pass
 
-            if payload is None:
-                continue
-
-            if ctype == "text/plain" and text_plain is None:
+        if part.get_content_type() == "text/html":
+            text_html = part.get_payload(decode=True)
+            if text_html:
+                charset = part.get_content_charset() or "utf-8"
                 try:
-                    text_plain = payload.decode(charset, errors="replace")
-                except Exception:
+                    return html_to_text(text_html.decode(charset, errors="replace"))
+                except:
                     pass
-
-            elif ctype == "text/html" and text_html is None:
-                try:
-                    text_html = payload.decode(charset, errors="replace")
-                except Exception:
-                    pass
-
-    else:
-        payload = msg.get_payload(decode=True)
-        charset = msg.get_content_charset() or "utf-8"
-        ctype = msg.get_content_type()
-
-        if payload:
-            try:
-                decoded = payload.decode(charset, errors="replace")
-            except Exception:
-                decoded = None
-
-            if ctype == "text/plain":
-                text_plain = decoded
-            elif ctype == "text/html":
-                text_html = decoded
-
-    if text_plain:
-        return text_plain
-    if text_html:
-        return html_to_text(text_html)
 
     return "(Geen leesbare inhoud gevonden)"
 
 
 # -------------------------------------------------------
-# 5. MQTT client (API v2 – future-proof)
+# MQTT client
 # -------------------------------------------------------
 mqtt_client = mqtt.Client(
     client_id="imap_cleaner",
     protocol=mqtt.MQTTv311,
-    transport="tcp",
-    callback_api_version=2,
+    callback_api_version=2
 )
 
 if MQTT_USER and MQTT_PASS:
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 
-print("IMAP Cleaner: MQTT client gestart", flush=True)
-
-
-# -------------------------------------------------------
-# 6. MQTT publish functie
-# -------------------------------------------------------
 def mqtt_send(data):
     try:
-        print("IMAP Cleaner: MQTT publish:", data, flush=True)
+        print("MQTT publish:", data, flush=True)
         mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
         mqtt_client.publish(MQTT_TOPIC, json.dumps(data))
         mqtt_client.disconnect()
@@ -184,52 +137,43 @@ def mqtt_send(data):
 
 
 # -------------------------------------------------------
-# 7. Hulpfunctie om UID uit FETCH-respons te halen
+# UID Parser (FALLBACK SAFE)
 # -------------------------------------------------------
-def parse_uid_from_response(fetch_header_bytes):
+def safe_get_uid(mail, msg_id):
     """
-    Voorbeeld header:
-    b'1 (UID 12345 RFC822 {3423}'
-    We trekken hier '12345' uit.
+    Retourneert UID indien beschikbaar,
+    anders fallback SEQ-msg_id.
     """
+
+    # Probeer officiële UID op te vragen via UID FETCH
     try:
-        header_str = fetch_header_bytes.decode("utf-8", errors="ignore")
-        parts = header_str.split()
-        for i, p in enumerate(parts):
-            if p.upper() == "UID" and i + 1 < len(parts):
-                return parts[i + 1]
-        return None
+        status, response = mail.uid("FETCH", msg_id, "(UID)")
+        if status == "OK" and response and isinstance(response[0], bytes):
+            text = response[0].decode("utf-8", errors="ignore")
+            # Zoek substring "UID <nummer>"
+            if "UID" in text.upper():
+                try:
+                    uid = text.upper().split("UID")[1].split()[0]
+                    return uid.strip()
+                except:
+                    pass
     except Exception as e:
-        print(
-            "IMAP Cleaner: kon UID niet parsen uit:",
-            fetch_header_bytes,
-            "fout:",
-            e,
-            flush=True,
-        )
-        return None
+        print(f"UID FETCH error voor {msg_id}: {e}", flush=True)
+
+    # FALLBACK
+    fallback_uid = f"SEQ-{msg_id.decode()}"
+    print(f"UID fallback gebruikt voor message {msg_id}: {fallback_uid}", flush=True)
+    return fallback_uid
 
 
 # -------------------------------------------------------
-# 8. Main loop – IMAP uitlezen
-#   - mark_as_read = True  -> mails worden als gelezen gemarkeerd
-#   - mark_as_read = False -> mails blijven ongelezen, UID's zorgen dat elke mail 1x verwerkt wordt
+# Main Loop
 # -------------------------------------------------------
 def run_imap_loop():
-    global processed_uids
-
     if MARK_AS_READ:
-        print(
-            "IMAP Cleaner: IMAP loop gestart in modus 'mark_as_read=True' "
-            "(mails worden als gelezen gemarkeerd)",
-            flush=True,
-        )
+        print("Modus: mark_as_read = TRUE (mails worden gelezen gemarkeerd)", flush=True)
     else:
-        print(
-            "IMAP Cleaner: IMAP loop gestart in modus 'mark_as_read=False' "
-            "(mails blijven ongelezen, UID-tracking actief)",
-            flush=True,
-        )
+        print("Modus: mark_as_read = FALSE (UID-deduplicatie, mails blijven ongelezen)", flush=True)
 
     while True:
         try:
@@ -237,119 +181,56 @@ def run_imap_loop():
             mail.login(IMAP_USER, IMAP_PASS)
 
             if MARK_AS_READ:
-                # Standaard read/write; FETCH zal \Seen vlag zetten
                 mail.select("INBOX")
             else:
-                # readonly=True, server zet geen \Seen vlag
                 mail.select("INBOX", readonly=True)
 
             status, ids = mail.search(None, "UNSEEN")
-            print("IMAP Cleaner: UNSEEN search:", status, ids, flush=True)
 
-            if status == "OK":
-                id_list = ids[0].split()
-                print(
-                    f"IMAP Cleaner: {len(id_list)} UNSEEN berichten gevonden",
-                    flush=True,
-                )
+            if status != "OK":
+                print("UNSEEN search mislukt:", status, flush=True)
+                mail.logout()
+                time.sleep(5)
+                continue
 
-                for msg_id in id_list:
-                    if MARK_AS_READ:
-                        # Eenvoudige modus: mails worden als gelezen gemarkeerd.
-                        res, msg_data = mail.fetch(msg_id, "(RFC822)")
-                        if res != "OK" or not msg_data or len(msg_data) < 1:
-                            print(
-                                "IMAP Cleaner: fetch mislukt voor ID",
-                                msg_id,
-                                "res=",
-                                res,
-                                flush=True,
-                            )
-                            continue
+            msg_ids = ids[0].split()
+            print(f"UNSEEN gevonden: {msg_ids}", flush=True)
 
-                        raw_email = msg_data[0][1]
-                        if not raw_email:
-                            print(
-                                "IMAP Cleaner: lege fetch data voor ID",
-                                msg_id,
-                                flush=True,
-                            )
-                            continue
+            for msg_id in msg_ids:
+                # Stap 1: UID correct ophalen
+                uid = safe_get_uid(mail, msg_id)
 
-                        msg = email.message_from_bytes(raw_email)
+                # Stap 2: Deduplicatie
+                if uid in processed_uids and not MARK_AS_READ:
+                    print(f"Skip (UID verwerkt): {uid}", flush=True)
+                    continue
 
-                        onderwerp = decode_header_value(msg.get("subject"))
-                        afzender = decode_header_value(msg.get("from"))
-                        tekst = extract_body(msg)
+                # Stap 3: FETCH BODY
+                status, data = mail.uid("FETCH", uid, "(RFC822)")
+                if status != "OK" or not data or len(data) < 1:
+                    print(f"UID FETCH faalde, fallback FETCH voor msg_id={msg_id}", flush=True)
+                    status, data = mail.fetch(msg_id, "(RFC822)")
+                    if status != "OK" or not data or len(data) < 1:
+                        print("FETCH faalde volledig", flush=True)
+                        continue
 
-                        payload = {
-                            "onderwerp": onderwerp,
-                            "afzender": afzender,
-                            "tekst": tekst,
-                        }
+                raw_email = data[0][1]
+                msg = email.message_from_bytes(raw_email)
 
-                        mqtt_send(payload)
+                onderwerp = decode_header_value(msg.get("subject"))
+                afzender = decode_header_value(msg.get("from"))
+                tekst = extract_body(msg)
 
-                    else:
-                        # Geavanceerde modus: mails blijven ongelezen, maar we doen UID-tracking.
-                        res, msg_data = mail.fetch(msg_id, "(UID RFC822)")
-                        if res != "OK" or not msg_data or len(msg_data) < 1:
-                            print(
-                                "IMAP Cleaner: fetch mislukt voor ID",
-                                msg_id,
-                                "res=",
-                                res,
-                                flush=True,
-                            )
-                            continue
+                mqtt_send({
+                    "onderwerp": onderwerp,
+                    "afzender": afzender,
+                    "tekst": tekst
+                })
 
-                        header_part = msg_data[0][0]
-                        raw_email = msg_data[0][1]
-
-                        if not header_part or not raw_email:
-                            print(
-                                "IMAP Cleaner: lege fetch data voor ID",
-                                msg_id,
-                                flush=True,
-                            )
-                            continue
-
-                        uid = parse_uid_from_response(header_part)
-                        if not uid:
-                            print(
-                                "IMAP Cleaner: geen UID gevonden voor ID",
-                                msg_id,
-                                flush=True,
-                            )
-                            continue
-
-                        if uid in processed_uids:
-                            print(
-                                f"IMAP Cleaner: UID {uid} al eerder verwerkt, overslaan",
-                                flush=True,
-                            )
-                            continue
-
-                        msg = email.message_from_bytes(raw_email)
-
-                        onderwerp = decode_header_value(msg.get("subject"))
-                        afzender = decode_header_value(msg.get("from"))
-                        tekst = extract_body(msg)
-
-                        payload = {
-                            "onderwerp": onderwerp,
-                            "afzender": afzender,
-                            "tekst": tekst,
-                        }
-
-                        mqtt_send(payload)
-
-                        processed_uids.add(uid)
-                        save_processed_uids(processed_uids)
-                        print(
-                            f"IMAP Cleaner: UID {uid} toegevoegd aan processed lijst",
-                            flush=True,
-                        )
+                # Stap 4: Markeer UID verwerkt
+                if not MARK_AS_READ:
+                    processed_uids.add(uid)
+                    save_processed_uids(processed_uids)
 
             mail.logout()
             time.sleep(5)
@@ -360,7 +241,7 @@ def run_imap_loop():
 
 
 # -------------------------------------------------------
-# 9. Start script
+# Start script
 # -------------------------------------------------------
 if __name__ == "__main__":
     run_imap_loop()
