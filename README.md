@@ -80,6 +80,7 @@ Payload-voorbeeld:
   "afzender": "no-reply@club.com",
   "tekst": "Dear Member,..."
 }
+```
 
 Om de Add-on te integreren in Home Assistant moet een MQTT sensor gemaakt worden.
 Open je config-file in een editor en voeg onderstaande toe:
@@ -90,10 +91,8 @@ mqtt:
     - name: "Clean IMAP Add-on Resultaten"
       unique_id: "clean_imap_addon_resultaten"
       state_topic: "mail/decoded"
-
       value_template: >
         {{ value_json.tekst[:200] ~ '...' }}
-
       json_attributes_topic: "mail/decoded"
       json_attributes_template: >
         {
