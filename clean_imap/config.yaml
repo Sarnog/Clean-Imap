@@ -1,6 +1,6 @@
 name: "IMAP Cleaner"
 description: "Decodeert IMAP e-mails en stuurt nette tekst naar Home Assistant via MQTT."
-version: "1.0.6"
+version: "1.0.7"
 slug: "imap_cleaner"
 arch:
   - amd64
